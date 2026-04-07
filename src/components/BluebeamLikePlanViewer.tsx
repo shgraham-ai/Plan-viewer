@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import * as pdfjsLib from "pdfjs-dist";
+import { upload } from "@vercel/blob/client";
 import {
   AreaChart,
   Circle,
@@ -297,9 +298,19 @@ type PersistedProject = {
   calibration: number;
   pageTexts: Record<number, string>;
   pageSheetNumbers?: Record<number, string>;
+  pdfBlobUrl?: string;
   layers: Layer[];
   users: User[];
   updatedAt: string;
+};
+
+type CloudProjectSummary = {
+  id: string;
+  name: string;
+  fileName: string;
+  updatedAt: string;
+  pdfBlobUrl?: string;
+  projectDataUrl: string;
 };
 
 type HistorySnapshot = {
@@ -403,6 +414,15 @@ function createId(): string {
     return crypto.randomUUID();
   }
   return `id_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sanitizePathSegment(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "") || "file";
 }
 
 function safeParse<T>(value: string | null, fallback: T): T {
@@ -1133,6 +1153,13 @@ export default function BluebeamLikePlanViewer() {
   const [projects, setProjects] = useState<PersistedProject[]>([]);
   const [projectName, setProjectName] = useState("Project Alpha");
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [cloudProjects, setCloudProjects] = useState<CloudProjectSummary[]>([]);
+  const [cloudStatus, setCloudStatus] = useState<"idle" | "ready" | "error">("idle");
+  const [cloudMessage, setCloudMessage] = useState("Shared cloud unavailable");
+  const [isCloudSaving, setIsCloudSaving] = useState(false);
+  const [isCloudLoading, setIsCloudLoading] = useState(false);
+  const [activePdfBlobUrl, setActivePdfBlobUrl] = useState("");
+  const [activePdfFile, setActivePdfFile] = useState<File | null>(null);
   const [showMarkupList, setShowMarkupList] = useState(false);
   const [markupFilter, setMarkupFilter] = useState("");
   const [markupStatusFilter, setMarkupStatusFilter] = useState("all");
@@ -1433,6 +1460,7 @@ export default function BluebeamLikePlanViewer() {
     setActiveMarkupFillOpacity(storedPreferences.activeMarkupFillOpacity);
     setLeftPanelWidth(clamp(storedPreferences.leftPanelWidth ?? 224, 190, 340));
     setRightPanelWidth(clamp(storedPreferences.rightPanelWidth ?? 288, 230, 400));
+    void refreshCloudProjects();
   }, []);
 
   useEffect(() => localStorage.setItem("plan_sessions_v5", JSON.stringify(sessions)), [sessions]);
@@ -1717,10 +1745,7 @@ export default function BluebeamLikePlanViewer() {
     };
   }, [temporaryPanActive]);
 
-  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const uploadRunId = Date.now();
+  function resetLoadedDocumentState(uploadRunId: number) {
     uploadRunRef.current = uploadRunId;
     setLoadError("");
     setPageSizes({});
@@ -1732,18 +1757,24 @@ export default function BluebeamLikePlanViewer() {
     clearSelection();
     setSnapPreview(null);
     pageTextFragmentsRef.current = {};
+  }
+
+  async function loadPdfFromSource(options: { fileName: string; data?: ArrayBuffer; url?: string; pdfBlobUrl?: string }) {
+    const uploadRunId = Date.now();
+    resetLoadedDocumentState(uploadRunId);
 
     try {
-      const buffer = await file.arrayBuffer();
-      const loadingTask = pdfjsLib.getDocument({ data: buffer });
+      const loadingTask = options.data ? pdfjsLib.getDocument({ data: options.data }) : pdfjsLib.getDocument(options.url || "");
       const doc = await loadingTask.promise;
       setPdfDoc(doc);
-      setFileName(file.name);
+      setFileName(options.fileName);
       setPageCount(doc.numPages);
       setCurrentPage(1);
       setWorkerStatus("ready");
+      setActivePdfBlobUrl(options.pdfBlobUrl || "");
       clearHistory();
       const sheetNumbers: Record<number, string> = {};
+
       void (async () => {
         for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
           if (uploadRunRef.current !== uploadRunId) return;
@@ -1805,6 +1836,21 @@ export default function BluebeamLikePlanViewer() {
       setPageSheetNumbers({});
       setPageThumbnails({});
       setAutoReferenceLinks({});
+      setActivePdfBlobUrl("");
+      throw error;
+    }
+  }
+
+  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setActivePdfFile(file);
+    setActivePdfBlobUrl("");
+    try {
+      const buffer = await file.arrayBuffer();
+      await loadPdfFromSource({ fileName: file.name, data: buffer });
+    } catch {
+      setActivePdfFile(null);
     }
   }
 
@@ -2031,6 +2077,37 @@ export default function BluebeamLikePlanViewer() {
 
   function openPdfPicker() {
     fileInputRef.current?.click();
+  }
+
+  async function refreshCloudProjects() {
+    try {
+      const response = await fetch("/api/cloud-projects", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`Cloud list failed (${response.status})`);
+      }
+      const payload = (await response.json()) as { projects?: CloudProjectSummary[] };
+      setCloudProjects((payload.projects || []).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))));
+      setCloudStatus("ready");
+      setCloudMessage("Shared cloud ready");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Shared cloud unavailable";
+      setCloudStatus("error");
+      setCloudMessage(message);
+    }
+  }
+
+  async function uploadCurrentPdfIfNeeded(projectId: string) {
+    if (!activePdfFile) return activePdfBlobUrl;
+    const uploadPath = `projects/${sanitizePathSegment(projectId)}/source/${sanitizePathSegment(activePdfFile.name)}`;
+    const uploaded = await upload(uploadPath, activePdfFile, {
+      access: "public",
+      handleUploadUrl: "/api/blob-upload",
+      clientPayload: JSON.stringify({ projectId, kind: "pdf", fileName: activePdfFile.name }),
+      multipart: true,
+    });
+    setActivePdfBlobUrl(uploaded.url);
+    setActivePdfFile(null);
+    return uploaded.url;
   }
 
   function announceStatus(message: string) {
@@ -3538,27 +3615,106 @@ export default function BluebeamLikePlanViewer() {
     );
   }
 
-  function saveProject() {
-    const payload: PersistedProject = { id: activeProjectId || createId(), name: projectName, fileName, annotations, calibration, pageTexts, pageSheetNumbers, layers, users, updatedAt: new Date().toISOString() };
+  async function saveProject() {
+    const projectId = activeProjectId || createId();
+    const basePayload: PersistedProject = {
+      id: projectId,
+      name: projectName,
+      fileName,
+      annotations,
+      calibration,
+      pageTexts,
+      pageSheetNumbers,
+      pdfBlobUrl: activePdfBlobUrl || undefined,
+      layers,
+      users,
+      updatedAt: new Date().toISOString(),
+    };
+
     setProjects((prev) => {
-      const others = prev.filter((item) => item.id !== payload.id);
-      return [payload, ...others];
+      const others = prev.filter((item) => item.id !== basePayload.id);
+      return [basePayload, ...others];
     });
-    setActiveProjectId(payload.id);
+    setActiveProjectId(projectId);
+
+    try {
+      setIsCloudSaving(true);
+      const pdfBlobUrl = await uploadCurrentPdfIfNeeded(projectId);
+      const payload = { ...basePayload, pdfBlobUrl: pdfBlobUrl || undefined, updatedAt: new Date().toISOString() };
+      const response = await fetch("/api/cloud-projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(`Cloud save failed (${response.status})`);
+      }
+      const result = (await response.json()) as { project?: CloudProjectSummary };
+      setProjects((prev) => {
+        const others = prev.filter((item) => item.id !== payload.id);
+        return [payload, ...others];
+      });
+      setCloudStatus("ready");
+      setCloudMessage("Shared cloud ready");
+      if (result.project) {
+        setCloudProjects((prev) => {
+          const others = prev.filter((item) => item.id !== result.project!.id);
+          return [result.project!, ...others].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+        });
+      } else {
+        await refreshCloudProjects();
+      }
+      announceStatus("Project saved to shared cloud");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Cloud save failed";
+      setCloudStatus("error");
+      setCloudMessage(message);
+      announceStatus("Saved locally, but shared cloud save failed");
+    } finally {
+      setIsCloudSaving(false);
+    }
   }
 
-  function loadProject(project: PersistedProject) {
+  async function loadProject(project: PersistedProject | (CloudProjectSummary & Partial<PersistedProject>)) {
     setActiveProjectId(project.id);
     setProjectName(project.name);
     setFileName(project.fileName || fileName);
-    setAnnotations(project.annotations || {});
-    setCalibration(project.calibration || 1);
-    setPageTexts(project.pageTexts || {});
-    setPageSheetNumbers(project.pageSheetNumbers || {});
-    if (project.layers) setLayers(project.layers);
-    if (project.users) setUsers(project.users);
-    clearSelection();
-    clearHistory();
+    try {
+      setIsCloudLoading(true);
+      let resolvedProject = project as PersistedProject;
+      const projectDataUrl = "projectDataUrl" in project ? project.projectDataUrl : undefined;
+      if (projectDataUrl) {
+        const response = await fetch(projectDataUrl, { cache: "no-store" });
+        if (!response.ok) throw new Error(`Cloud project load failed (${response.status})`);
+        resolvedProject = await response.json();
+      }
+
+      if (resolvedProject.pdfBlobUrl) {
+        await loadPdfFromSource({
+          fileName: resolvedProject.fileName || fileName,
+          url: resolvedProject.pdfBlobUrl,
+          pdfBlobUrl: resolvedProject.pdfBlobUrl,
+        });
+        setActivePdfFile(null);
+      }
+
+      setAnnotations(resolvedProject.annotations || {});
+      setCalibration(resolvedProject.calibration || 1);
+      setPageTexts(resolvedProject.pageTexts || {});
+      setPageSheetNumbers(resolvedProject.pageSheetNumbers || {});
+      if (resolvedProject.layers) setLayers(resolvedProject.layers);
+      if (resolvedProject.users) setUsers(resolvedProject.users);
+      clearSelection();
+      clearHistory();
+      announceStatus(`Loaded ${resolvedProject.name}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to load project";
+      setCloudStatus("error");
+      setCloudMessage(message);
+      announceStatus(message);
+    } finally {
+      setIsCloudLoading(false);
+    }
   }
 
   function runOcrSearch() {
@@ -4262,8 +4418,14 @@ export default function BluebeamLikePlanViewer() {
             <Input ref={fileInputRef} type="file" accept="application/pdf" onChange={handleUpload} />
             <Input value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="Project name" />
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={saveProject}><FolderOpen className="h-4 w-4" />Save Project</Button>
+              <Button size="sm" onClick={() => void saveProject()} disabled={isCloudSaving || isCloudLoading}><FolderOpen className="h-4 w-4" />{isCloudSaving ? "Saving..." : "Save Project"}</Button>
+              <Button size="sm" variant="outline" onClick={() => void refreshCloudProjects()} disabled={isCloudSaving || isCloudLoading}><Download className="h-4 w-4" />Refresh Cloud</Button>
               <Badge variant="secondary" className="max-w-full truncate">{fileName}</Badge>
+            </div>
+            <div className={`rounded-2xl border p-3 text-xs ${cloudStatus === "ready" ? "border-emerald-800 bg-emerald-950/40 text-emerald-200" : "border-amber-800 bg-amber-950/30 text-amber-200"}`}>
+              <div><strong className="text-slate-100">Shared Cloud:</strong> {cloudStatus === "ready" ? "Connected" : "Needs attention"}</div>
+              <div className="text-slate-300">{cloudMessage}</div>
+              <div className="mt-2 text-slate-400">Projects and PDFs saved here can be opened from other devices.</div>
             </div>
             <div className="rounded-2xl border border-slate-700 bg-[#12161b] p-3 text-xs text-slate-300">
               <div><strong className="text-slate-100">Worker:</strong> {workerStatus}</div>
@@ -4271,8 +4433,28 @@ export default function BluebeamLikePlanViewer() {
             </div>
             {loadError ? <div className="rounded-xl border border-red-800 bg-red-950/60 p-3 text-xs text-red-200">{loadError}</div> : null}
             <div className="space-y-2">
+              <div className="text-[11px] uppercase tracking-[0.14em] text-slate-500">Shared Projects</div>
+              {cloudProjects.length ? (
+                cloudProjects.map((project) => (
+                  <button key={project.id} onClick={() => void loadProject(project)} className={`w-full rounded-xl border p-2 text-left transition ${activeProjectId === project.id ? "border-amber-400 bg-[#2a1f0e]" : "border-slate-700 bg-[#12161b] hover:bg-[#181d24]"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="font-medium text-slate-100">{project.name}</div>
+                      <Badge variant="secondary" className="text-[10px]">Cloud</Badge>
+                    </div>
+                    <div className="text-xs text-slate-500">{project.fileName || "No file"}</div>
+                    <div className="text-[11px] text-slate-600">{new Date(project.updatedAt).toLocaleString()}</div>
+                  </button>
+                ))
+              ) : (
+                <div className="rounded-xl border border-dashed border-slate-700 bg-[#12161b] p-3 text-xs text-slate-500">
+                  No shared projects yet. Upload a PDF and save a project to publish it to the cloud.
+                </div>
+              )}
+            </div>
+            <div className="space-y-2">
+              <div className="text-[11px] uppercase tracking-[0.14em] text-slate-500">Local Browser Projects</div>
               {projects.map((project) => (
-                <button key={project.id} onClick={() => loadProject(project)} className={`w-full rounded-xl border p-2 text-left transition ${activeProjectId === project.id ? "border-amber-400 bg-[#2a1f0e]" : "border-slate-700 bg-[#12161b] hover:bg-[#181d24]"}`}>
+                <button key={project.id} onClick={() => void loadProject(project)} className={`w-full rounded-xl border p-2 text-left transition ${activeProjectId === project.id ? "border-amber-400 bg-[#2a1f0e]" : "border-slate-700 bg-[#12161b] hover:bg-[#181d24]"}`}>
                   <div className="font-medium text-slate-100">{project.name}</div>
                   <div className="text-xs text-slate-500">{project.fileName || "No file"}</div>
                 </button>

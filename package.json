@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@vercel/blob": "^1.1.1",
     "framer-motion": "^11.11.17",
     "lucide-react": "^0.469.0",
     "pdfjs-dist": "^4.10.38",

@@ -6,3 +6,5 @@ dist
 .vercel
 dev.log
 dev.err.log
+
+.vercel
