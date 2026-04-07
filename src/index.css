@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.1), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(245, 158, 11, 0.08), transparent 22%),
+    linear-gradient(180deg, #181c22 0%, #101317 100%);
+  color: #e2e8f0;
+}
+
+canvas {
+  display: block;
+}
+
+::selection {
+  background: rgba(245, 158, 11, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}

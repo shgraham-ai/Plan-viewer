@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+.vs
+.edge-profile
+dev.log
+dev.err.log
